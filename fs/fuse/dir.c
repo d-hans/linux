@@ -523,7 +523,7 @@ out_err:
  */
 static int fuse_create_open(struct inode *dir, struct dentry *entry,
 			    struct file *file, unsigned int flags,
-			    umode_t mode)
+			    umode_t mode, uint32_t opcode)
 {
 	int err;
 	struct inode *inode;
@@ -535,8 +535,10 @@ static int fuse_create_open(struct inode *dir, struct dentry *entry,
 	struct fuse_entry_out outentry;
 	struct fuse_inode *fi;
 	struct fuse_file *ff;
+	struct dentry *res = NULL;
 	void *security_ctx = NULL;
 	u32 security_ctxlen;
+	bool ext_create = (opcode == FUSE_CREATE_EXT ? true : false);
 
 	/* Userspace expects S_IFREG in create mode */
 	BUG_ON((mode & S_IFMT) != S_IFREG);
@@ -566,7 +568,7 @@ static int fuse_create_open(struct inode *dir, struct dentry *entry,
 		inarg.open_flags |= FUSE_OPEN_KILL_SUIDGID;
 	}
 
-	args.opcode = FUSE_CREATE;
+	args.opcode = opcode;
 	args.nodeid = get_node_id(dir);
 	args.in_numargs = 2;
 	args.in_args[0].size = sizeof(inarg);
@@ -613,9 +615,37 @@ static int fuse_create_open(struct inode *dir, struct dentry *entry,
 		goto out_err;
 	}
 	kfree(forget);
-	d_instantiate(entry, inode);
+	/*
+	 * In extended create, fuse_lookup() was skipped, which also uses
+	 * d_splice_alias(). As we come directly here after picking up dentry
+	 * it is very much likely that dentry has DCACHE_PAR_LOOKUP flag set
+	 * on it so call d_splice_alias().
+	 */
+	if (!ext_create && !d_in_lookup(entry))
+		d_instantiate(entry, inode);
+	else {
+		res = d_splice_alias(inode, entry);
+		if (IS_ERR(res)) {
+			/* Close the file in user space, but do not unlink it,
+			 * if it was created - with network file systems other
+			 * clients might have already accessed it.
+			 */
+			fi = get_fuse_inode(inode);
+			fuse_sync_release(fi, ff, flags);
+			fuse_queue_forget(fm->fc, forget, outentry.nodeid, 1);
+			err = PTR_ERR(res);
+			goto out_err;
+		}
+	}
 	fuse_change_entry_timeout(entry, &outentry);
-	fuse_dir_changed(dir);
+	/*
+	 * This should be always set when the file is created, but only
+	 * CREATE_EXT introduced FOPEN_FILE_CREATED to user space.
+	 */
+	if (!ext_create || (outopen.open_flags & FOPEN_FILE_CREATED)) {
+		fuse_dir_changed(dir);
+		file->f_mode |= FMODE_CREATED;
+	}
 	err = finish_open(file, entry, generic_file_open);
 	if (err) {
 		fi = get_fuse_inode(inode);
@@ -634,6 +664,29 @@ out_err:
 	return err;
 }
 
+static int fuse_create_ext(struct inode *dir, struct dentry *entry,
+			   struct file *file, unsigned int flags,
+			   umode_t mode)
+{
+	int err;
+	struct fuse_conn *fc = get_fuse_conn(dir);
+
+	if (fc->no_create_ext)
+		return -ENOSYS;
+
+	err = fuse_create_open(dir, entry, file, flags, mode,
+			       FUSE_CREATE_EXT);
+	/* If ext create is not implemented then indicate in fc so that next
+	 * request falls back to normal create instead of going into libufse and
+	 * returning with -ENOSYS.
+	 */
+	if (err == -ENOSYS) {
+		if (!fc->no_create_ext)
+			fc->no_create_ext = 1;
+	}
+	return err;
+}
+
 static int fuse_mknod(struct user_namespace *, struct inode *, struct dentry *,
 		      umode_t, dev_t);
 static int fuse_atomic_open(struct inode *dir, struct dentry *entry,
@@ -643,29 +696,35 @@ static int fuse_atomic_open(struct inode *dir, struct dentry *entry,
 	int err;
 	struct fuse_conn *fc = get_fuse_conn(dir);
 	struct dentry *res = NULL;
+	bool create = flags & O_CREAT ? true : false;
 
 	if (fuse_is_bad(dir))
 		return -EIO;
 
-	if (d_in_lookup(entry)) {
+lookup:
+	if ((!create || fc->no_create_ext) && d_in_lookup(entry)) {
 		res = fuse_lookup(dir, entry, 0);
 		if (IS_ERR(res))
 			return PTR_ERR(res);
-
 		if (res)
 			entry = res;
 	}
-
-	if (!(flags & O_CREAT) || d_really_is_positive(entry))
+	if (!create || d_really_is_positive(entry))
 		goto no_open;
-
-	/* Only creates */
-	file->f_mode |= FMODE_CREATED;
 
 	if (fc->no_create)
 		goto mknod;
 
-	err = fuse_create_open(dir, entry, file, flags, mode);
+	if (!fc->no_create_ext) {
+		err = fuse_create_ext(dir, entry, file, flags, mode);
+		/* If libfuse/user space has not implemented extended create,
+		 * fall back to normal create.
+		 */
+		if (err == -ENOSYS)
+			goto lookup;
+	} else
+		err = fuse_create_open(dir, entry, file, flags, mode,
+				       FUSE_CREATE);
 	if (err == -ENOSYS) {
 		fc->no_create = 1;
 		goto mknod;
@@ -683,6 +742,7 @@ no_open:
 }
 
 /*
+
  * Code shared between mknod, mkdir, symlink and link
  */
 static int create_new_entry(struct fuse_mount *fm, struct fuse_args *args,

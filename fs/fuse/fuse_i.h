@@ -669,6 +669,12 @@ struct fuse_conn {
 	/** Is open/release not implemented by fs? */
 	unsigned no_open:1;
 
+	/*
+	 * Is atomic lookup-create-open(extended create) not implemented
+	 * by fs?
+	 */
+	unsigned no_create_ext:1;
+
 	/** Is opendir/releasedir not implemented by fs? */
 	unsigned no_opendir:1;
 
