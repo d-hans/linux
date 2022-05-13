@@ -516,14 +516,15 @@ out_err:
 }
 
 /*
- * Atomic create+open operation
+ * If user has not implemented create ext or Atomic open + lookup
+ * then fall back to usual Atomic create/open operations.
  *
- * If the filesystem doesn't support this, then fall back to separate
- * 'mknod' + 'open' requests.
+ * If the filesystem doesn't support Atomic create + open, then
+ * fall back to separate 'mknod' + 'open' requests.
  */
 static int fuse_atomic_common(struct inode *dir, struct dentry *entry,
-			      struct file *file, unsigned int flags,
-			      umode_t mode, uint32_t opcode)
+			      struct dentry **alias, struct file *file,
+			      unsigned int flags, umode_t mode, uint32_t opcode)
 {
 	int err;
 	struct inode *inode;
@@ -538,10 +539,21 @@ static int fuse_atomic_common(struct inode *dir, struct dentry *entry,
 	struct dentry *res = NULL;
 	void *security_ctx = NULL;
 	u32 security_ctxlen;
-	bool ext_create = (opcode == FUSE_CREATE_EXT ? true : false);
+	bool simple_create = (opcode == FUSE_CREATE ? true : false);
+	bool create_ops = (simple_create || opcode == FUSE_CREATE_EXT) ?
+			   true : false;
+	bool skipped_lookup = (opcode == FUSE_CREATE_EXT ||
+			       opcode == FUSE_ATOMIC_OPEN) ? true : false;
+
+	if (alias)
+		*alias = NULL;
 
 	/* Userspace expects S_IFREG in create mode */
-	BUG_ON((mode & S_IFMT) != S_IFREG);
+	if (create_ops && (mode & S_IFMT) != S_IFREG) {
+		WARN_ON(1);
+		err = -EINVAL;
+		goto out_err;
+	}
 
 	forget = fuse_alloc_forget();
 	err = -ENOMEM;
@@ -616,33 +628,38 @@ static int fuse_atomic_common(struct inode *dir, struct dentry *entry,
 	}
 	kfree(forget);
 	/*
-	 * In extended create, fuse_lookup() was skipped, which also uses
-	 * d_splice_alias(). As we come directly here after picking up dentry
-	 * it is very much likely that dentry has DCACHE_PAR_LOOKUP flag set
-	 * on it so call d_splice_alias().
+	 * In extended create/atomic open, fuse_lookup() is skipped which also
+	 * uses d_splice_alias(). As we come directly here after picking up
+	 * dentry it is very much likely that dentry has DCACHE_PAR_LOOKUP flag
+	 * set on it so call d_splice_alias().
 	 */
-	if (!ext_create && !d_in_lookup(entry))
-		d_instantiate(entry, inode);
-	else {
+	if (skipped_lookup) {
 		res = d_splice_alias(inode, entry);
-		if (IS_ERR(res)) {
-			/* Close the file in user space, but do not unlink it,
-			 * if it was created - with network file systems other
-			 * clients might have already accessed it.
-			 */
-			fi = get_fuse_inode(inode);
-			fuse_sync_release(fi, ff, flags);
-			fuse_queue_forget(fm->fc, forget, outentry.nodeid, 1);
-			err = PTR_ERR(res);
-			goto out_err;
+		if (res) {
+			if (IS_ERR(res)) {
+				/* Close the file in user space, but do not unlink it,
+				 * if it was created - with network file systems other
+				 * clients might have already accessed it.
+				 */
+				fi = get_fuse_inode(inode);
+				fuse_sync_release(fi, ff, flags);
+				fuse_queue_forget(fm->fc, forget, outentry.nodeid, 1);
+				err = PTR_ERR(res);
+				goto out_err;
+			}
+			entry = res;
+			if (alias)
+				*alias = res;
 		}
-	}
+	} else
+		d_instantiate(entry, inode);
+
 	fuse_change_entry_timeout(entry, &outentry);
 	/*
 	 * This should be always set when the file is created, but only
 	 * CREATE_EXT introduced FOPEN_FILE_CREATED to user space.
 	 */
-	if (!ext_create || (outopen.open_flags & FOPEN_FILE_CREATED)) {
+	if (simple_create || (outopen.open_flags & FOPEN_FILE_CREATED)) {
 		fuse_dir_changed(dir);
 		file->f_mode |= FMODE_CREATED;
 	}
@@ -674,7 +691,7 @@ static int fuse_create_ext(struct inode *dir, struct dentry *entry,
 	if (fc->no_create_ext)
 		return -ENOSYS;
 
-	err = fuse_atomic_common(dir, entry, file, flags, mode,
+	err = fuse_atomic_common(dir, entry, NULL, file, flags, mode,
 				 FUSE_CREATE_EXT);
 	/* If ext create is not implemented then indicate in fc so that next
 	 * request falls back to normal create instead of going into libufse and
@@ -687,6 +704,31 @@ static int fuse_create_ext(struct inode *dir, struct dentry *entry,
 	return err;
 }
 
+static int fuse_do_atomic_open(struct inode *dir, struct dentry *entry,
+				struct dentry **alias, struct file *file,
+				unsigned int flags, umode_t mode)
+{
+	int err;
+	struct fuse_conn *fc = get_fuse_conn(dir);
+
+	if (fc->no_atomic_open)
+		return -ENOSYS;
+
+	err = fuse_atomic_common(dir, entry, alias, file, flags, mode,
+				 FUSE_ATOMIC_OPEN);
+
+	/* Set if atomic open not implemented */
+	if (err == -ENOSYS) {
+		if (!fc->no_atomic_open)
+			fc->no_atomic_open = 1;
+
+	} else if (!fc->atomic_o_trunc) {
+		/* If atomic open is set then imply atomic truncate as well */
+		fc->atomic_o_trunc = 1;
+	}
+	return err;
+}
+
 static int fuse_mknod(struct user_namespace *, struct inode *, struct dentry *,
 		      umode_t, dev_t);
 static int fuse_atomic_open(struct inode *dir, struct dentry *entry,
@@ -695,13 +737,22 @@ static int fuse_atomic_open(struct inode *dir, struct dentry *entry,
 {
 	int err;
 	struct fuse_conn *fc = get_fuse_conn(dir);
-	struct dentry *res = NULL;
+	struct dentry *res = NULL, *alias = NULL;
 	bool create = flags & O_CREAT ? true : false;
 
 	if (fuse_is_bad(dir))
 		return -EIO;
 
+	if (!create && !fc->no_atomic_open) {
+		err = fuse_do_atomic_open(dir, entry, &alias,
+					  file, flags, mode);
+		res = alias;
+		if (err != -ENOSYS)
+			goto out_dput;
+	}
+
 lookup:
+	/* Fall back to open- user space does not have full atomic open */
 	if ((!create || fc->no_create_ext) && d_in_lookup(entry)) {
 		res = fuse_lookup(dir, entry, 0);
 		if (IS_ERR(res))
@@ -723,7 +774,7 @@ lookup:
 		if (err == -ENOSYS)
 			goto lookup;
 	} else
-		err = fuse_atomic_common(dir, entry, file, flags, mode,
+		err = fuse_atomic_common(dir, entry, NULL, file, flags, mode,
 					 FUSE_CREATE);
 	if (err == -ENOSYS) {
 		fc->no_create = 1;
