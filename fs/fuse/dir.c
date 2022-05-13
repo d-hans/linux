@@ -521,9 +521,9 @@ out_err:
  * If the filesystem doesn't support this, then fall back to separate
  * 'mknod' + 'open' requests.
  */
-static int fuse_create_open(struct inode *dir, struct dentry *entry,
-			    struct file *file, unsigned int flags,
-			    umode_t mode, uint32_t opcode)
+static int fuse_atomic_common(struct inode *dir, struct dentry *entry,
+			      struct file *file, unsigned int flags,
+			      umode_t mode, uint32_t opcode)
 {
 	int err;
 	struct inode *inode;
@@ -674,8 +674,8 @@ static int fuse_create_ext(struct inode *dir, struct dentry *entry,
 	if (fc->no_create_ext)
 		return -ENOSYS;
 
-	err = fuse_create_open(dir, entry, file, flags, mode,
-			       FUSE_CREATE_EXT);
+	err = fuse_atomic_common(dir, entry, file, flags, mode,
+				 FUSE_CREATE_EXT);
 	/* If ext create is not implemented then indicate in fc so that next
 	 * request falls back to normal create instead of going into libufse and
 	 * returning with -ENOSYS.
@@ -723,8 +723,8 @@ lookup:
 		if (err == -ENOSYS)
 			goto lookup;
 	} else
-		err = fuse_create_open(dir, entry, file, flags, mode,
-				       FUSE_CREATE);
+		err = fuse_atomic_common(dir, entry, file, flags, mode,
+					 FUSE_CREATE);
 	if (err == -ENOSYS) {
 		fc->no_create = 1;
 		goto mknod;
